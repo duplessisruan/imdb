@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,7 +16,24 @@ import (
 	"time"
 )
 
-var once = false
+const (
+	OMDB_KEY  = "d171b5cf"
+	CHAN_SIZE = 128
+	READ_SIZE = 8 * 1024
+	N_THREAD  = 1024
+)
+
+type filter struct {
+	index int
+	value string
+}
+
+type parameters struct {
+	filters     []filter
+	reqCount    int
+	reqCountMtx sync.Mutex
+	plotFilter  *string
+}
 
 type result struct {
 	id    string
@@ -23,21 +41,10 @@ type result struct {
 	plot  string
 }
 
-type filter struct {
-	index int
-	value string
-}
-
-const (
-	CHAN_SIZE = 128
-	READ_SIZE = 2 * 1024
-	N_THREAD  = 20
-)
-
 func process(
 	results *[]result,
 	resultsMtx *sync.Mutex,
-	filters []filter,
+	params *parameters,
 	sigCh chan os.Signal,
 	readCh chan []byte,
 	dataCh chan []byte,
@@ -58,20 +65,20 @@ func process(
 			lines := strings.Split(string(data), "\n")
 			for _, line := range lines {
 				vs := strings.Split(line, "\t")
-				for _, filter := range filters {
+				for _, filter := range params.filters {
 					if vs[filter.index] != filter.value {
 						goto SKIP
 					}
 				}
 				{
-					var omdbResp struct {
-						title string
-						plot  string
-					}
-					if !once {
-						once = true
-
-						if resp, err := http.Get("http://www.omdbapi.com?i=" + vs[0]); err != nil {
+					var omdbResp struct{ Plot string }
+					params.reqCountMtx.Lock()
+					if params.reqCount == 0 {
+						params.reqCountMtx.Unlock()
+					} else {
+						params.reqCount--
+						params.reqCountMtx.Unlock()
+						if resp, err := http.Get("http://www.omdbapi.com?" + "apikey=" + OMDB_KEY + "&i=" + vs[0]); err != nil {
 							log.Fatal(err)
 						} else if err = json.NewDecoder(resp.Body).Decode(&omdbResp); err != nil {
 							log.Fatal(err)
@@ -80,7 +87,7 @@ func process(
 						}
 					}
 					resultsMtx.Lock()
-					*results = append(*results, result{id: vs[0], title: omdbResp.title, plot: omdbResp.plot})
+					*results = append(*results, result{id: vs[0], title: vs[2], plot: omdbResp.Plot})
 					resultsMtx.Unlock()
 				}
 			SKIP:
@@ -89,7 +96,7 @@ func process(
 		case prefix := <-readCh:
 			n, err = zr.Read(buf)
 			if err == io.EOF {
-				fmt.Printf("Done\n")
+				sigCh <- syscall.SIGINT
 				return
 			}
 			if err != nil {
@@ -118,39 +125,109 @@ func process(
 	}
 }
 
+func parse(params *parameters) (string, time.Duration) {
+	filePath := flag.String("filePath", "./title.basics.tsv.gz", "absolute path to the inflated `title.basics.tsv.gz` file")
+
+	titleType := flag.String("titleType", "", "filter on `titleType` column")
+	primaryTitle := flag.String("primaryTitle", "", "filter on `primaryTitle` column")
+	originalTitle := flag.String("originalTitle", "", "filter on `originalTitle` column")
+	startYear := flag.String("startYear", "", "filter on `startYear` column")
+	endYear := flag.String("endYear", "", "filter on `endYear` column")
+	runtimeMinutes := flag.String("runtimeMinutes", "", "filter on `runtimeMinutes` column")
+	genres := flag.String("genres", "", "filter on `genres` column")
+
+	maxRunTime := flag.String("maxRunTime", "10m", "maximum run time of the application. Format is a `time.Duration` string see [here](https://godoc.org/time#ParseDuration)")
+
+	maxApiRequests := flag.Int("maxApiRequests", 0, "maximum number of requests to be made to [omdbapi](https://www.omdbapi.com/)")
+	maxRequests := flag.Int("maxRequests", 0, "maximum number of requests to send to [omdbapi](https://www.omdbapi.com/)")
+	params.plotFilter = flag.String("plotFilter", "", "regex pattern to apply to the plot of a film retrieved from [omdbapi](https://www.omdbapi.com/)")
+
+	flag.Parse()
+
+	duration, err := time.ParseDuration(*maxRunTime)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if *maxApiRequests != 0 {
+		params.reqCount = *maxApiRequests
+	} else {
+		params.reqCount = *maxRequests
+	}
+
+	if *titleType != "" {
+		params.filters = append(params.filters, filter{1, *titleType})
+	}
+	if *primaryTitle != "" {
+		params.filters = append(params.filters, filter{2, *primaryTitle})
+	}
+	if *originalTitle != "" {
+		params.filters = append(params.filters, filter{3, *originalTitle})
+	}
+	if *startYear != "" {
+		params.filters = append(params.filters, filter{5, *startYear})
+	}
+	if *endYear != "" {
+		params.filters = append(params.filters, filter{6, *startYear})
+	}
+	if *runtimeMinutes != "" {
+		params.filters = append(params.filters, filter{7, *startYear})
+	}
+	if *genres != "" {
+		params.filters = append(params.filters, filter{8, *startYear})
+	}
+
+	return *filePath, duration
+}
+
 func main() {
+	var params parameters
+	filePath, timeout := parse(&params)
 	sigCh := make(chan os.Signal, 1)
 	go func() {
-		time.Sleep(1000 * time.Second)
+		time.Sleep(timeout)
 		sigCh <- syscall.SIGINT
 	}()
 
-	if fp, err := os.Open("./title.basics.tsv.gz"); err != nil {
+	if fp, err := os.Open(filePath); err != nil {
 		log.Fatal(err)
 	} else if zr, err := gzip.NewReader(fp); err != nil {
 		log.Fatal(err)
 	} else {
-		var results []result
-		var resultsMtx sync.Mutex
-		filters := []filter{{1, "movie"}}
-		readCh := make(chan []byte, CHAN_SIZE)
-		dataCh := make(chan []byte, CHAN_SIZE)
-		var wg sync.WaitGroup
+		results := []result{{id: "IMDB_ID", title: "Title", plot: "Plot"}}
+		{
+			var resultsMtx sync.Mutex
+			readCh := make(chan []byte, CHAN_SIZE)
+			dataCh := make(chan []byte, CHAN_SIZE)
+			var wg sync.WaitGroup
 
-		signal.Notify(sigCh, syscall.SIGINT)
-		for i := 0; i != N_THREAD; i++ {
-			go process(&results, &resultsMtx, filters, sigCh, readCh, dataCh, &wg, zr)
+			signal.Notify(sigCh, syscall.SIGINT)
+			for i := 0; i != N_THREAD; i++ {
+				go process(&results, &resultsMtx, &params, sigCh, readCh, dataCh, &wg, zr)
+			}
+
+			wg.Add(N_THREAD)
+			readCh <- make([]byte, 0)
+			wg.Wait()
+
+			zr.Close()
+			fp.Close()
+
 		}
 
-		wg.Add(N_THREAD)
-		readCh <- make([]byte, 0)
-		wg.Wait()
-
-		zr.Close()
-		fp.Close()
-		fmt.Println("\nIMDB_ID     |   Title               |   Plot")
+		idSize := 0
+		titleSize := 0
 		for _, result := range results {
-			fmt.Printf("%s | %s | %s\n", result.id, result.title, result.plot)
+			if idSize < len(result.id) {
+				idSize = len(result.id)
+			}
+			if titleSize < len(result.title) {
+				titleSize = len(result.title)
+			}
+		}
+		fmt.Println()
+		for _, result := range results {
+			fmt.Printf("%-*s   |   %-*s    |   %s\n", idSize, result.id, titleSize, result.title, result.plot)
 		}
 	}
 }
