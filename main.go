@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,7 +33,7 @@ type parameters struct {
 	filters     []filter
 	reqCount    int
 	reqCountMtx sync.Mutex
-	plotFilter  *string
+	plotRe      *regexp.Regexp
 }
 
 type result struct {
@@ -58,8 +59,8 @@ func process(
 
 	for {
 		select {
-		case <-sigCh:
-			sigCh <- syscall.SIGINT
+		case sig := <-sigCh:
+			sigCh <- sig
 			return
 		case data := <-dataCh:
 			lines := strings.Split(string(data), "\n")
@@ -86,6 +87,11 @@ func process(
 							log.Fatal(err)
 						}
 					}
+					if params.plotRe != nil {
+						if !params.plotRe.MatchString(omdbResp.Plot) {
+							goto SKIP
+						}
+					}
 					resultsMtx.Lock()
 					*results = append(*results, result{id: vs[0], title: vs[2], plot: omdbResp.Plot})
 					resultsMtx.Unlock()
@@ -96,7 +102,7 @@ func process(
 		case prefix := <-readCh:
 			n, err = zr.Read(buf)
 			if err == io.EOF {
-				sigCh <- syscall.SIGINT
+				sigCh <- syscall.SIGKILL
 				return
 			}
 			if err != nil {
@@ -140,7 +146,7 @@ func parse(params *parameters) (string, time.Duration) {
 
 	maxApiRequests := flag.Int("maxApiRequests", 0, "maximum number of requests to be made to [omdbapi](https://www.omdbapi.com/)")
 	maxRequests := flag.Int("maxRequests", 0, "maximum number of requests to send to [omdbapi](https://www.omdbapi.com/)")
-	params.plotFilter = flag.String("plotFilter", "", "regex pattern to apply to the plot of a film retrieved from [omdbapi](https://www.omdbapi.com/)")
+	plotFilter := flag.String("plotFilter", "", "regex pattern to apply to the plot of a film retrieved from [omdbapi](https://www.omdbapi.com/)")
 
 	flag.Parse()
 
@@ -177,6 +183,12 @@ func parse(params *parameters) (string, time.Duration) {
 		params.filters = append(params.filters, filter{8, *startYear})
 	}
 
+	if *plotFilter != "" {
+		if params.plotRe, err = regexp.Compile(*plotFilter); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	return *filePath, duration
 }
 
@@ -186,7 +198,13 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	go func() {
 		time.Sleep(timeout)
-		sigCh <- syscall.SIGINT
+		select {
+		case sig := <-sigCh:
+			sigCh <- sig
+			break
+		default:
+			sigCh <- syscall.SIGKILL
+		}
 	}()
 
 	if fp, err := os.Open(filePath); err != nil {
@@ -201,7 +219,7 @@ func main() {
 			dataCh := make(chan []byte, CHAN_SIZE)
 			var wg sync.WaitGroup
 
-			signal.Notify(sigCh, syscall.SIGINT)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			for i := 0; i != N_THREAD; i++ {
 				go process(&results, &resultsMtx, &params, sigCh, readCh, dataCh, &wg, zr)
 			}
@@ -212,7 +230,13 @@ func main() {
 
 			zr.Close()
 			fp.Close()
+		}
 
+		select {
+		case sig := <-sigCh:
+			if sig == syscall.SIGINT || sig == syscall.SIGTERM {
+				return
+			}
 		}
 
 		idSize := 0
@@ -225,9 +249,13 @@ func main() {
 				titleSize = len(result.title)
 			}
 		}
-		fmt.Println()
 		for _, result := range results {
-			fmt.Printf("%-*s   |   %-*s    |   %s\n", idSize, result.id, titleSize, result.title, result.plot)
+			fmt.Printf("%-*s   |   %-*s    |   ", idSize, result.id, titleSize, result.title)
+			if result.plot == "" {
+				fmt.Println(nil)
+			} else {
+				fmt.Println(result.plot)
+			}
 		}
 	}
 }
